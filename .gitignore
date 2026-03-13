@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+secrets/*
+!secrets/.gitignore
+!secrets/README.md
+config/openclaw/*.key
+config/openclaw/*.pem
+
+# Logs
+*.log
+setup.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# docs
+docs/note/

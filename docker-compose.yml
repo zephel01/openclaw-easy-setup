@@ -1,0 +1,163 @@
+# =============================================================================
+# openclaw-easy-setup — Docker Compose
+# Security-hardened OpenClaw + Ollama (local LLM) stack
+# =============================================================================
+# Usage:
+#   cp .env.example .env   # Edit with your API keys
+#   docker compose up -d   # Start all services
+#   docker compose logs -f # Watch logs
+# =============================================================================
+
+services:
+  # ── OpenClaw Gateway ─────────────────────────────────────────────────────
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw
+    restart: unless-stopped
+    env_file:
+      # ┌─────────────────────────────────────────────────────────────────────┐
+      # │ ALL variables in .env are passed into the container.               │
+      # │ API keys, Base URLs, messaging tokens — everything just works.     │
+      # │                                                                     │
+      # │ The "environment:" block below ONLY overrides variables that need  │
+      # │ Docker-specific values (gateway bind, Ollama internal URL, etc.)   │
+      # │ All other .env variables (MOONSHOT_BASE_URL, CEREBRAS_BASE_URL,   │
+      # │ TELEGRAM_BOT_TOKEN, etc.) pass through untouched.                  │
+      # └─────────────────────────────────────────────────────────────────────┘
+      - .env
+    environment:
+      # --- Docker-specific overrides (do not set these in .env) ---
+      OPENCLAW_GATEWAY_BIND: "0.0.0.0"          # 0.0.0.0 inside container; ports mapped to 127.0.0.1 on host
+      OPENCLAW_GATEWAY_PORT: "18789"
+      OLLAMA_BASE_URL: "http://ollama:11434"     # Docker internal DNS — overrides any .env value
+      # --- Defaults from .env (with fallbacks) ---
+      OPENCLAW_AUTH_MODE: "${OPENCLAW_AUTH_MODE:-token}"
+      OPENCLAW_AUTH_TOKEN: "${OPENCLAW_AUTH_TOKEN:-}"
+      OPENCLAW_DM_POLICY: "${OPENCLAW_DM_POLICY:-open}"
+      OPENCLAW_REQUIRE_MENTION: "${OPENCLAW_REQUIRE_MENTION:-true}"
+      OPENCLAW_DENY_TOOLS: "${OPENCLAW_DENY_TOOLS:-exec,browser,cron}"
+      TZ: "${TZ:-Asia/Tokyo}"
+    ports:
+      # Bind to localhost ONLY — never expose to 0.0.0.0
+      - "127.0.0.1:18789:18789"
+    volumes:
+      # Persistent data — config, sessions, channels, credentials
+      # entrypoint.sh populates this with defaults on first run
+      - openclaw-data:/home/openclaw/.openclaw
+      # Optionally mount host config (read-only) — merged by entrypoint
+      - ./config/openclaw:/etc/openclaw:ro
+      # API keys and tokens — mounted as read-only files, not env vars.
+      # Place individual files in secrets/ (e.g. secrets/ANTHROPIC_API_KEY)
+      # entrypoint.sh reads these and injects them into the process environment.
+      # This keeps secrets out of `docker inspect` and compose config.
+      - ./secrets:/run/secrets:ro
+    networks:
+      - openclaw-net
+    depends_on:
+      ollama:
+        condition: service_started
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+      - /run:size=64M
+      # Node.js / OpenClaw needs writable dirs even with read_only filesystem
+      - /home/openclaw/.cache:size=128M
+      - /home/openclaw/.npm:size=128M
+      - /home/openclaw/.config:size=64M
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:18789/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Ollama (Local LLM) ──────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      # Bind to localhost only
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - openclaw-net
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+    # GPU support (uncomment for NVIDIA)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "4.0"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Ollama Model Puller (one-shot init) ─────────────────────────────────
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - openclaw-net
+    restart: "no"
+    entrypoint: >
+      sh -c '
+        echo "Pulling default models..."
+        curl -sf http://ollama:11434/api/pull -d "{\"name\":\"${OLLAMA_DEFAULT_MODEL:-llama3.2}\"}" || true
+        echo "Model pull complete."
+      '
+
+# ── Volumes (persistent across restarts and `docker compose down`) ────────
+# WARNING: `docker compose down -v` DELETES these volumes and all data!
+volumes:
+  # OpenClaw: config, sessions, channels, credentials, agent memory, logs
+  openclaw-data:
+    driver: local
+  # Ollama: downloaded model weights (can be multi-GB)
+  ollama-models:
+    driver: local
+
+# ── Network ────────────────────────────────────────────────────────────────
+networks:
+  openclaw-net:
+    driver: bridge
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
